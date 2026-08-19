@@ -253,6 +253,31 @@ def waitQuiet(driver, timeout=30.0):
 	return False
 
 
+def settle(driver, timeout=5.0):
+	"""Wait until nothing of the previous utterance can still reach the device.
+
+	A cancel does not unblock a feed that is already inside the player, so
+	without this a leftover slice lands after player.reset() and is mistaken
+	for the next utterance's first audio.
+	"""
+	def quiet():
+		return (
+			not driver._busy
+			and driver._queue.empty()
+			and driver._feedQueue.empty()
+			and not driver._feeding
+		)
+
+	end = time.perf_counter() + timeout
+	while time.perf_counter() < end:
+		if quiet():
+			time.sleep(0.03)
+			if quiet():
+				return True
+		time.sleep(0.005)
+	return False
+
+
 def waitFirstFeed(player, timeout=8.0):
 	end = time.perf_counter() + timeout
 	while player.firstFeedTime() is None and time.perf_counter() < end:
@@ -339,6 +364,7 @@ def armHold(driver):
 	driver.speak(["Superseded"])
 	time.sleep(0.05)
 	driver.cancel()
+	settle(driver)
 
 
 def test_hold_not_armed_by_ordinary_navigation():
@@ -353,6 +379,7 @@ def test_hold_not_armed_by_ordinary_navigation():
 	driver.speak(["List item that the user actually listens to"])
 	time.sleep(0.5)
 	driver.cancel()
+	settle(driver)
 	player.reset()
 	asked = time.perf_counter()
 	driver.speak(["Next list item"])
@@ -378,6 +405,7 @@ def test_hold_armed_by_a_rapid_cancel():
 	waitQuiet(driver)
 
 	# Device drained, no cancel in between: this must start immediately.
+	settle(driver)
 	player.reset()
 	time.sleep(0.05)
 	asked = time.perf_counter()
@@ -403,6 +431,32 @@ def test_killed_inside_hold():
 	driver.terminate()
 
 
+# --------------------------------------------------------------- cushion
+def test_engine_runs_ahead_of_the_device():
+	"""The engine must build a cushion, not track playback sample for sample.
+
+	feed() blocks until the device has room, so while it ran on the thread the
+	engine calls back on, synthesis was paced by playback and the device never
+	had anything in hand: a scheduling hiccup starved it mid-word. Measured
+	here as audio produced minus audio playback has had time to consume.
+	"""
+	driver = SynthDriver()
+	player = driver._player
+	driver.speak([
+		"It was a bright cold day in April and the clocks were striking thirteen. " * 4
+	])
+	start = waitFirstFeed(player)
+	deadline = start + 0.6
+	while time.perf_counter() < deadline:
+		time.sleep(0.005)
+	produced = driver._fedBytes / 2.0 / SR
+	cushion = produced - (time.perf_counter() - start)
+	check("the engine runs ahead of the device",
+		  cushion > 0.5, "%.0f ms of cushion" % (cushion * 1000))
+	driver.cancel()
+	driver.terminate()
+
+
 # ------------------------------------------------------ continuous reading
 def test_continuous_reading():
 	driver = SynthDriver()
@@ -410,6 +464,7 @@ def test_continuous_reading():
 	del indexReached.events[:]
 	del doneSpeaking.events[:]
 	driver.cancel()
+	settle(driver)
 	player.reset()
 	texts = [
 		"Chapter one. " * 3,
@@ -449,6 +504,7 @@ test_cancel_storm()
 test_hold_not_armed_by_ordinary_navigation()
 test_hold_armed_by_a_rapid_cancel()
 test_killed_inside_hold()
+test_engine_runs_ahead_of_the_device()
 test_continuous_reading()
 
 print()
