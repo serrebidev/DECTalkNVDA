@@ -330,23 +330,50 @@ def test_cancel_storm():
 
 
 # ----------------------------------------------------------- startup hold
-def test_startup_hold():
-	"""The hold is paid once per generation, i.e. once per cancel.
+def armHold(driver):
+	"""Reproduce the pattern the hold exists for, so it arms.
 
-	It exists so an announcement NVDA kills ~150 ms after asking for it is
-	never heard at all; every such announcement is preceded by a cancel. Later
-	utterances of the same burst are a continuation NVDA is committed to, and
-	holding those inserts dead air whenever the pipeline has run dry.
+	NVDA asks for an announcement and kills it well inside the hold window
+	because a newer event superseded it.
+	"""
+	driver.speak(["Superseded"])
+	time.sleep(0.05)
+	driver.cancel()
+
+
+def test_hold_not_armed_by_ordinary_navigation():
+	"""An announcement that ran its normal course must not cost latency.
+
+	This is the arrow-key case: each announcement lives ~500 ms until the
+	next key press ends it. Holding the next one back there is a flat latency
+	tax on every key press, which is exactly what it sounded like.
 	"""
 	driver = SynthDriver()
 	player = driver._player
-
+	driver.speak(["List item that the user actually listens to"])
+	time.sleep(0.5)
 	driver.cancel()
+	player.reset()
+	asked = time.perf_counter()
+	driver.speak(["Next list item"])
+	delay = (waitFirstFeed(player) - asked) * 1000
+	check("announcement after an ordinary cancel starts immediately",
+		  delay < 120, "%.0f ms" % delay)
+	waitQuiet(driver)
+	driver.terminate()
+
+
+def test_hold_armed_by_a_rapid_cancel():
+	"""The hold is paid once per generation once NVDA has shown the pattern."""
+	driver = SynthDriver()
+	player = driver._player
+
+	armHold(driver)
 	player.reset()
 	asked = time.perf_counter()
 	driver.speak(["Hello there"])
 	delay = (waitFirstFeed(player) - asked) * 1000
-	check("first utterance after a cancel is held",
+	check("first announcement after a rapid cancel is held",
 		  160 <= delay <= 400, "%.0f ms" % delay)
 	waitQuiet(driver)
 
@@ -359,23 +386,13 @@ def test_startup_hold():
 	check("later utterance of the same burst is not held",
 		  delay < 150, "%.0f ms" % delay)
 	waitQuiet(driver)
-
-	# The next cancel arms it again.
-	driver.cancel()
-	player.reset()
-	asked = time.perf_counter()
-	driver.speak(["Third"])
-	delay = (waitFirstFeed(player) - asked) * 1000
-	check("the hold re-arms after the next cancel",
-		  160 <= delay <= 400, "%.0f ms" % delay)
-	waitQuiet(driver)
 	driver.terminate()
 
 
 def test_killed_inside_hold():
 	driver = SynthDriver()
 	player = driver._player
-	driver.cancel()
+	armHold(driver)
 	player.reset()
 	driver.speak(["Window title that should never be heard"])
 	time.sleep(0.15)
@@ -429,7 +446,8 @@ def test_continuous_reading():
 test_nothing_heard_after_cancel(0.0, "fast log")
 test_nothing_heard_after_cancel(0.25, "slow log write")
 test_cancel_storm()
-test_startup_hold()
+test_hold_not_armed_by_ordinary_navigation()
+test_hold_armed_by_a_rapid_cancel()
 test_killed_inside_hold()
 test_continuous_reading()
 

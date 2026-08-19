@@ -101,14 +101,19 @@ class SynthDriver(BaseSynthDriver):
 			availableInSettingsRing=True,
 		),
 		NumericDriverSetting(
-			# NVDA routinely asks for an announcement and then cancels it
-			# ~150 ms later when a newer focus event arrives (alt+tab is the
-			# worst case). Feeding the moment audio exists lets a syllable
-			# escape before the cancel lands, heard as stuttering. Holding the
-			# first audio of an utterance back this long means such an
-			# announcement is never heard at all. The hold is measured from
-			# when NVDA asked, and only the first utterance after a cancel
-			# pays it — continuous speech is unaffected. 0 disables it.
+			# NVDA sometimes asks for an announcement and then cancels it
+			# ~150 ms later, when a newer event supersedes it. Feeding the
+			# moment audio exists lets a syllable escape before the cancel
+			# lands, heard as stuttering. Holding the first audio of an
+			# utterance back this long means such an announcement is never
+			# heard at all.
+			#
+			# The hold is not paid on every announcement — that is a flat
+			# latency tax on every key press, which is what it felt like. It
+			# arms only once NVDA has actually just killed an announcement
+			# this fast, and disarms as soon as one survives longer, so
+			# ordinary navigation (where announcements live ~500 ms until the
+			# next key press) speaks immediately. 0 disables it entirely.
 			"startupHold", "Hold before first audio (ms)", defaultVal=180,
 			minVal=0, maxVal=500, normalStep=20,
 			availableInSettingsRing=True,
@@ -184,15 +189,21 @@ class SynthDriver(BaseSynthDriver):
 		self._spf = 100
 		self._startupHold = 180
 		self._holdUntil = None
+		# When NVDA last asked for speech, and whether the cancel that killed
+		# it came inside the hold window. Together they decide whether the
+		# next announcement is worth holding back: NVDA supersedes an
+		# announcement that fast only in bursts, and outside them the hold is
+		# pure latency on every key press.
+		self._lastSpeakAt = None
+		self._holdArmed = False
 		# The generation the hold was last paid on. A generation only ever
 		# changes in cancel(), so "first utterance of a generation" is exactly
-		# "first announcement after NVDA cancelled" — the case the hold exists
-		# for. Later utterances of the same burst are a continuation NVDA is
-		# already committed to, and holding those back inserts dead air
-		# whenever the pipeline has momentarily run dry (measured in a live
-		# capture: 180 ms of silence dropped into the middle of a four-part
-		# announcement, because the device happened to drain 17 ms before the
-		# next part was queued).
+		# "first announcement after NVDA cancelled". Later utterances of the
+		# same burst are a continuation NVDA is already committed to, and
+		# holding those back inserts dead air whenever the pipeline has
+		# momentarily run dry (measured in a live capture: 180 ms of silence
+		# dropped into the middle of a four-part announcement, because the
+		# device happened to drain 17 ms before the next part was queued).
 		self._heldGeneration = None
 		self._sentencePause = 0
 		self._commaPause = 0
@@ -255,17 +266,30 @@ class SynthDriver(BaseSynthDriver):
 
 	def speak(self, speechSequence):
 		ops = self._buildOps(speechSequence)
-		self._queue.put((self._generation, ops, time.perf_counter()))
+		queuedAt = time.perf_counter()
+		self._lastSpeakAt = queuedAt
+		self._queue.put((self._generation, ops, queuedAt))
 
 	def cancel(self):
-		# Bump first, log last. This runs on NVDA's main thread, and every
-		# moment between NVDA asking and the generation bump is audio of the
-		# cancelled utterance that the feed path is still allowed to hand to
-		# the device. Building a debug line — and the log file write behind
-		# it — is bounded by nothing; in a live capture it held the bump off
-		# long enough for 320 ms of a killed announcement to reach the player
-		# *after* the cancel, heard as a fragment of the old announcement
-		# trailing into the new one.
+		"""Silence immediately. Runs on NVDA's main thread.
+
+		Everything here is ordered by how much it costs to be late. The clock
+		reading comes first because it is a statement about when NVDA asked;
+		the generation bump next, because every moment before it is audio of
+		the cancelled utterance the feed path is still allowed to hand over;
+		the debug line last, because building it — and the log file write
+		behind it — is bounded by nothing, and in a live capture it held the
+		bump off long enough for 320 ms of a killed announcement to reach the
+		player after the cancel.
+		"""
+		# The startup hold is armed only when this cancel is the pattern the
+		# hold exists for: an announcement superseded before it had a chance
+		# to be heard.
+		lastSpeakAt = self._lastSpeakAt
+		self._holdArmed = (
+			lastSpeakAt is not None
+			and (time.perf_counter() - lastSpeakAt) * 1000 <= self._startupHold
+		)
 		with self._genLock:
 			self._generation += 1
 		self._player.stop()
@@ -478,7 +502,11 @@ class SynthDriver(BaseSynthDriver):
 			self._firstFeed = None
 			self._holdUntil = (
 				queuedAt + self._startupHold / 1000.0
-				if self._startupHold and generation != self._heldGeneration
+				if (
+					self._startupHold
+					and self._holdArmed
+					and generation != self._heldGeneration
+				)
 				else None
 			)
 			self._heldGeneration = generation
