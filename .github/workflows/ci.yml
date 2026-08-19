@@ -32,6 +32,10 @@ jobs:
         shell: pwsh
         run: python tests/test_sonic.py
 
+      - name: Driver cancel/hold tests
+        shell: pwsh
+        run: python tests/test_driver.py
+
       - name: Package add-on
         shell: pwsh
         run: python scripts/package.py

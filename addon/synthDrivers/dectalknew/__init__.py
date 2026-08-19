@@ -107,8 +107,8 @@ class SynthDriver(BaseSynthDriver):
 			# escape before the cancel lands, heard as stuttering. Holding the
 			# first audio of an utterance back this long means such an
 			# announcement is never heard at all. The hold is measured from
-			# when NVDA asked, so it only costs latency on the first utterance
-			# of a burst — continuous speech is unaffected. 0 disables it.
+			# when NVDA asked, and only the first utterance after a cancel
+			# pays it — continuous speech is unaffected. 0 disables it.
 			"startupHold", "Hold before first audio (ms)", defaultVal=180,
 			minVal=0, maxVal=500, normalStep=20,
 			availableInSettingsRing=True,
@@ -149,6 +149,11 @@ class SynthDriver(BaseSynthDriver):
 	}
 	supportedNotifications = {synthIndexReached, synthDoneSpeaking}
 
+	#: Bytes handed to the player per feed() call (50 ms of 16-bit mono).
+	#: A cancel takes effect within one of these instead of within one engine
+	#: buffer, which is up to 0.74 s.
+	SLICE_BYTES = 2 * (_dectalk.SAMPLE_RATE // 20)
+
 	@classmethod
 	def check(cls):
 		import os
@@ -179,12 +184,16 @@ class SynthDriver(BaseSynthDriver):
 		self._spf = 100
 		self._startupHold = 180
 		self._holdUntil = None
-		self._holdGeneration = 0
-		# True while the device still has audio of ours to play. The startup
-		# hold is only worth paying when it does not — mid-stream there is a
-		# backlog covering the next utterance already, and delaying it there
-		# would insert exactly the gaps the hold exists to avoid.
-		self._audioLive = False
+		# The generation the hold was last paid on. A generation only ever
+		# changes in cancel(), so "first utterance of a generation" is exactly
+		# "first announcement after NVDA cancelled" — the case the hold exists
+		# for. Later utterances of the same burst are a continuation NVDA is
+		# already committed to, and holding those back inserts dead air
+		# whenever the pipeline has momentarily run dry (measured in a live
+		# capture: 180 ms of silence dropped into the middle of a four-part
+		# announcement, because the device happened to drain 17 ms before the
+		# next part was queued).
+		self._heldGeneration = None
 		self._sentencePause = 0
 		self._commaPause = 0
 		self._splitMultiCase = True
@@ -249,10 +258,18 @@ class SynthDriver(BaseSynthDriver):
 		self._queue.put((self._generation, ops, time.perf_counter()))
 
 	def cancel(self):
-		if log.isEnabledFor(log.DEBUG):
-			log.debug("DECtalk: cancel at %.2f s in dump" % (self._dumpPos(),))
+		# Bump first, log last. This runs on NVDA's main thread, and every
+		# moment between NVDA asking and the generation bump is audio of the
+		# cancelled utterance that the feed path is still allowed to hand to
+		# the device. Building a debug line — and the log file write behind
+		# it — is bounded by nothing; in a live capture it held the bump off
+		# long enough for 320 ms of a killed announcement to reach the player
+		# *after* the cancel, heard as a fragment of the old announcement
+		# trailing into the new one.
 		with self._genLock:
 			self._generation += 1
+		self._player.stop()
+		self._engine.stop()
 		for q in (self._queue, self._doneQueue):
 			try:
 				while True:
@@ -261,9 +278,8 @@ class SynthDriver(BaseSynthDriver):
 						break
 			except queue.Empty:
 				pass
-		self._audioLive = False  # stop() empties the device
-		self._player.stop()
-		self._engine.stop()
+		if log.isEnabledFor(log.DEBUG):
+			log.debug("DECtalk: cancel at %.2f s in dump" % (self._dumpPos(),))
 
 	def pause(self, switch):
 		self._player.pause(switch)
@@ -460,12 +476,12 @@ class SynthDriver(BaseSynthDriver):
 			self._busy = True
 			self._fedBytes = 0
 			self._firstFeed = None
-			self._holdGeneration = generation
 			self._holdUntil = (
 				queuedAt + self._startupHold / 1000.0
-				if self._startupHold and not self._audioLive
+				if self._startupHold and generation != self._heldGeneration
 				else None
 			)
+			self._heldGeneration = generation
 			started = time.perf_counter()
 			try:
 				self._processUtterance(generation, ops)
@@ -523,7 +539,6 @@ class SynthDriver(BaseSynthDriver):
 				self._player.idle()
 			except Exception:
 				log.exception("DECtalk: player idle failed")
-			self._audioLive = False
 			if log.isEnabledFor(log.DEBUG):
 				log.debug(
 					"DECtalk: drained player in %.0f ms"
@@ -546,7 +561,7 @@ class SynthDriver(BaseSynthDriver):
 			# would otherwise surface at this utterance's first flush.
 			# Flush the stragglers through, then discard everything.
 			self._sonicStream.flush()
-			self._drainSonic(discard=True)
+			self._drainSonic(generation, discard=True)
 			self._sonicStream.speed = self._sonicSpeed()
 		speed = self._sonicSpeed() if self._sonicActive else 1.0
 		for kind, payload in ops:
@@ -564,33 +579,59 @@ class SynthDriver(BaseSynthDriver):
 			elif kind == "silence":
 				frames = int(_dectalk.SAMPLE_RATE * payload / 1000.0 / speed)
 				if frames > 0 and generation == self._generation:
-					self._playerFeed(b"\x00\x00" * frames)
+					self._playerFeed(generation, b"\x00\x00" * frames)
 		# Player idle + synthDoneSpeaking are handled by _workerLoop once the
 		# whole queue drains, so continuous reading isn't interrupted between
 		# chunks (see the comment there).
 
 	# -- Sonic time-stretch (rate boost) --------------------------------------
 
-	def _playerFeed(self, pcm, onDone=None):
+	def _playerFeed(self, generation, pcm, onDone=None):
 		"""The single point every sample passes through, so the debug timing
-		above can see when audio actually starts reaching the device."""
-		if self._holdGeneration != self._generation:
+		above can see when audio actually starts reaching the device.
+
+		Audio reaches the device in SLICE_BYTES pieces rather than whole engine
+		buffers. feed() blocks on the device's backpressure, so one call can sit
+		there for most of a second, and a cancel arriving during it cannot take
+		effect until it returns. Slicing bounds that to one slice, and the
+		recheck after each feed() flushes even that one: cancel() runs stop() on
+		the main thread, so a slice handed over while the call was blocked went
+		in *behind* the stop and would otherwise be the only thing the user
+		hears of the cancelled announcement.
+		"""
+		if generation != self._generation:
 			return  # cancelled; nothing of this utterance may be heard
-		if self._holdUntil is not None and not self._waitOutStartupHold():
+		if self._holdUntil is not None and not self._waitOutStartupHold(generation):
+			return
+		if not pcm:
+			if onDone is not None:
+				onDone()
 			return
 		if self._firstFeed is None:
 			self._firstFeed = time.perf_counter()
-		self._fedBytes += len(pcm)
-		self._audioLive = True
-		if log.isEnabledFor(log.DEBUG):
-			self._writeDump(pcm)
-		elif self._dump is not None:
+		debug = log.isEnabledFor(log.DEBUG)
+		if not debug and self._dump is not None:
 			self._closeDump()
-		self._player.feed(pcm, onDone=onDone)
+		step = self.SLICE_BYTES
+		for start in range(0, len(pcm), step):
+			if generation != self._generation:
+				self._player.stop()
+				return
+			piece = pcm[start:start + step]
+			self._fedBytes += len(piece)
+			if debug:
+				self._writeDump(piece)
+			last = start + step >= len(pcm)
+			self._player.feed(piece, onDone=onDone if last else None)
+			if generation != self._generation:
+				# Cancelled while that feed() was blocked, so it landed behind
+				# cancel's stop(). Flush the device again.
+				self._player.stop()
+				return
 
 	# -- debug audio dump ----------------------------------------------------
 
-	def _waitOutStartupHold(self):
+	def _waitOutStartupHold(self, generation):
 		"""Block until this utterance's startup hold expires.
 
 		Returns False if it was cancelled while waiting, in which case not one
@@ -602,7 +643,6 @@ class SynthDriver(BaseSynthDriver):
 		self._holdUntil = None
 		if deadline is None:
 			return True
-		generation = self._holdGeneration
 		while True:
 			if generation != self._generation:
 				return False
@@ -654,26 +694,30 @@ class SynthDriver(BaseSynthDriver):
 			except Exception:
 				log.exception("DECtalk: closing audio dump failed")
 
-	def _drainSonic(self, discard=False, onDone=None):
+	def _drainSonic(self, generation, discard=False, onDone=None):
 		"""Feed the player everything Sonic has processed so far."""
 		stream = self._sonicStream
 		if stream.samplesAvailable > 0:
 			data = stream.readShort()
 			if not discard:
-				self._playerFeed(ctypes.string_at(data, len(data) * 2), onDone=onDone)
+				self._playerFeed(
+					generation, ctypes.string_at(data, len(data) * 2), onDone=onDone
+				)
 				return
 		if onDone is not None:
 			onDone()
 
 	def _flushSonic(self, generation, onDone=None):
 		self._sonicStream.flush()
-		self._drainSonic(discard=generation != self._generation, onDone=onDone)
+		self._drainSonic(
+			generation, discard=generation != self._generation, onDone=onDone
+		)
 
 	def _feed(self, generation, pcm, onDone=None):
 		"""Feed PCM to the player, through Sonic when rate boost is active."""
 		if not self._sonicActive:
 			if pcm:
-				self._playerFeed(pcm, onDone=onDone)
+				self._playerFeed(generation, pcm, onDone=onDone)
 			elif onDone is not None:
 				onDone()
 			return
@@ -688,7 +732,7 @@ class SynthDriver(BaseSynthDriver):
 			# distortion Sonic warns about is inaudible).
 			self._flushSonic(generation, onDone=onDone)
 		else:
-			self._drainSonic()
+			self._drainSonic(generation)
 
 	def _onBuffer(self, generation, state, pcm, marks):
 		"""Feed one engine buffer to the player, splitting it at index marks

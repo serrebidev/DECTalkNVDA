@@ -27,7 +27,7 @@ WAVE_FORMAT_1M16 = 0x0004  # 11.025 kHz, mono, 16-bit
 
 SAMPLE_RATE = 11025
 BUFFER_COUNT = 4
-BUFFER_BYTES = 16384  # ~0.37 s of 11025 Hz 16-bit mono per buffer
+BUFFER_BYTES = 16384  # up to ~0.74 s of 11025 Hz 16-bit mono per buffer
 MAX_INDEX_MARKS = 128
 
 #: The nine predefined speakers, in SPEAKER_T order.
