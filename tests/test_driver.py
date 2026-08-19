@@ -99,6 +99,21 @@ class FakePlayer:
 		self.closed = True
 
 	# -- measurement
+	def silentGaps(self, floorMs=15):
+		"""Gaps where the device played out everything it had and sat silent.
+
+		Returns [(atSecond, gapMs)]. This is the "move, to, focus" symptom:
+		the audio itself is continuous, the playback of it is not.
+		"""
+		with self.lock:
+			segs = sorted(self.segs)
+		gaps = []
+		for (aStart, aEnd), (bStart, _bEnd) in zip(segs, segs[1:]):
+			gap = (bStart - aEnd) * 1000
+			if gap >= floorMs:
+				gaps.append((aEnd, gap))
+		return gaps
+
 	def heardAfter(self, when):
 		"""Seconds of audio that actually reached the ears after `when`."""
 		with self.lock:
@@ -243,11 +258,21 @@ def check(name, ok, detail=""):
 
 
 def waitQuiet(driver, timeout=30.0):
+	"""Wait until synthesis, the feed queue and playback have all finished.
+
+	The feed queue matters: the engine runs a second or more ahead of the
+	device, so synthesis being done says nothing about playback being done.
+	"""
 	end = time.perf_counter() + timeout
 	while time.perf_counter() < end:
-		if not driver._busy and driver._queue.empty() and driver._doneQueue.empty():
+		if (
+			not driver._busy
+			and driver._queue.empty()
+			and driver._feedQueue.empty()
+			and not driver._feeding
+		):
 			driver._player.idle()
-			if not driver._busy and driver._queue.empty():
+			if not driver._busy and driver._queue.empty() and driver._feedQueue.empty():
 				return True
 		time.sleep(0.01)
 	return False
@@ -317,9 +342,9 @@ def test_nothing_heard_after_cancel(writeDelay, label):
 				heard * 1000, handed / 2.0 / SR * 1000),
 		)
 		check(
-			"at most one slice handed over after cancel (%s)" % label,
-			handed <= SynthDriver.SLICE_BYTES,
-			"%d bytes" % handed,
+			"at most one chunk handed over after cancel (%s)" % label,
+			handed <= 2 * SR,  # one engine buffer is at most 0.74 s
+			"%.0f ms" % (handed / 2.0 / SR * 1000),
 		)
 	finally:
 		log.debugEnabled = False
@@ -457,6 +482,37 @@ def test_engine_runs_ahead_of_the_device():
 	driver.terminate()
 
 
+# --------------------------------------------------------- feed cadence
+def test_device_is_fed_in_whole_chunks():
+	"""Every feed() must carry real time's worth of audio, not a sliver.
+
+	WavePlayer.feed() blocks until the device has room and keeps it fed from
+	inside NVDA's own code for the duration of the chunk. Handing it small
+	pieces instead means coming back to Python between them, and every one of
+	those hand-backs is a deadline that a busy machine can miss -- the device
+	plays out what it has and sits silent, heard as "move, to, focus" in audio
+	that is itself continuous. There is no way to model Windows' scheduler
+	here, so the test pins the property that decides it: how often the driver
+	has to be scheduled to keep playback alive.
+	"""
+	driver = SynthDriver()
+	player = driver._player
+	driver.speak([
+		"Move to focus. The quick brown fox jumps over the lazy dog. " * 3
+	])
+	waitQuiet(driver, timeout=60)
+	audio = player.totalBytes() / 2.0 / SR
+	calls = len(player.fed)
+	perSecond = calls / audio if audio else 0
+	check("the device is fed in whole chunks",
+		  perSecond <= 5, "%.1f feed calls per second of audio" % perSecond)
+	gaps = player.silentGaps()
+	check("playback is continuous", not gaps,
+		  "%d gaps, worst %.0f ms" % (
+			  len(gaps), max((g for _, g in gaps), default=0.0)))
+	driver.terminate()
+
+
 # ------------------------------------------------------ continuous reading
 def test_continuous_reading():
 	driver = SynthDriver()
@@ -478,16 +534,16 @@ def test_continuous_reading():
 		mark.index = i + 1
 		driver.speak([mark, text])
 	finished = waitQuiet(driver, timeout=60)
-	time.sleep(0.4)  # let the completion thread settle
+	end = time.perf_counter() + 3
+	while not doneSpeaking.events and time.perf_counter() < end:
+		time.sleep(0.01)  # let the completion thread settle
 	audio = player.totalBytes() / 2.0 / SR
-	with player.lock:
-		fed = list(player.fed)
-	steps = [b[0] - a[0] for a, b in zip(fed, fed[1:])]
-	biggest = max(steps) * 1000 if steps else 0.0
+	gaps = player.silentGaps()
 	check("continuous reading completes", finished)
 	check("continuous reading produced audio", audio > 5.0, "%.2f s" % audio)
-	check("the device is handed audio in small steps",
-		  biggest < 250, "largest step %.0f ms" % biggest)
+	check("continuous reading plays without gaps", not gaps,
+		  "%d gaps, worst %.0f ms" % (
+			  len(gaps), max((g for _, g in gaps), default=0.0)))
 	marks = [kw["index"] for kw in indexReached.events]
 	check("index marks arrive in order",
 		  marks == sorted(marks) and len(marks) == len(texts), str(marks))
@@ -505,6 +561,7 @@ test_hold_not_armed_by_ordinary_navigation()
 test_hold_armed_by_a_rapid_cancel()
 test_killed_inside_hold()
 test_engine_runs_ahead_of_the_device()
+test_device_is_fed_in_whole_chunks()
 test_continuous_reading()
 
 print()

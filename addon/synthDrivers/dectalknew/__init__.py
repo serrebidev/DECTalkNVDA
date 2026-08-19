@@ -154,16 +154,12 @@ class SynthDriver(BaseSynthDriver):
 	}
 	supportedNotifications = {synthIndexReached, synthDoneSpeaking}
 
-	#: Bytes handed to the player per feed() call (50 ms of 16-bit mono).
-	#: A cancel takes effect within one of these instead of within one engine
-	#: buffer, which is up to 0.74 s.
-	SLICE_BYTES = 2 * (_dectalk.SAMPLE_RATE // 20)
-
-	#: How far the engine may run ahead of the device, in SLICE_BYTES pieces.
-	#: This is the cushion that absorbs a scheduling hiccup without the device
-	#: running dry; it costs no latency, because playback still starts on the
-	#: first slice. Beyond it the queue is what paces synthesis to real time.
-	PREBUFFER_SLICES = 20  # 1.0 s
+	#: How far the engine may run ahead of the device, in bytes of 16-bit
+	#: mono. This is the cushion that absorbs a scheduling hiccup without the
+	#: device running dry; it costs no latency, because playback still starts
+	#: on the first chunk. Beyond it the queue is what paces synthesis to real
+	#: time.
+	PREBUFFER_BYTES = 2 * _dectalk.SAMPLE_RATE  # 1.0 s
 
 	@classmethod
 	def check(cls):
@@ -258,7 +254,9 @@ class SynthDriver(BaseSynthDriver):
 		# the engine calls back on tied synthesis to playback. The engine
 		# could never build up a cushion, and DECtalk only runs a little
 		# faster than real time, so any hiccup starved the device mid-word.
-		self._feedQueue = queue.Queue(maxsize=self.PREBUFFER_SLICES)
+		self._feedQueue = queue.Queue()
+		self._pendingBytes = 0  # queued for the device but not handed over yet
+		self._pendingLock = threading.Lock()
 		self._feedThread = threading.Thread(
 			target=self._feedLoop, name="DECtalkFeed", daemon=True
 		)
@@ -329,6 +327,8 @@ class SynthDriver(BaseSynthDriver):
 			except queue.Empty:
 				pass
 		self._streamStart = None  # the device is empty again
+		with self._pendingLock:
+			self._pendingBytes = 0
 		if log.isEnabledFor(log.DEBUG):
 			log.debug("DECtalk: cancel at %.2f s in dump" % (self._dumpPos(),))
 
@@ -652,14 +652,19 @@ class SynthDriver(BaseSynthDriver):
 
 	def _playerFeed(self, generation, pcm, onDone=None):
 		"""The single point every sample passes through: queue it for the
-		device in SLICE_BYTES pieces.
+		device, whole.
 
-		This runs on the thread the engine calls back on, so blocking here is
-		blocking synthesis. It only blocks once PREBUFFER_SLICES are already
-		waiting — up to that point the engine runs ahead of the device, which
-		is the cushion that keeps a scheduling hiccup from starving playback.
-		Slicing also means a cancel takes effect within 50 ms rather than
-		within one engine buffer, which is up to 0.74 s.
+		Chunks are never split. WavePlayer.feed() blocks until the device has
+		room and keeps it fed from inside NVDA's own code for the whole chunk;
+		handing it small pieces instead means coming back to Python between
+		them, and any wait longer than a piece lasts is the device playing out
+		what it had and sitting silent — "move, to, focus" instead of "move to
+		focus", in audio that is itself continuous.
+
+		This runs on the thread the engine calls back on, so blocking here
+		blocks synthesis. It only blocks once PREBUFFER_BYTES are already
+		waiting: up to that point the engine runs ahead of the device, and
+		beyond it the queue is what paces synthesis to real time.
 		"""
 		if generation != self._generation:
 			return  # cancelled; nothing of this utterance may be heard
@@ -671,26 +676,23 @@ class SynthDriver(BaseSynthDriver):
 			return
 		if self._firstFeed is None:
 			self._firstFeed = time.perf_counter()
-		step = self.SLICE_BYTES
-		for start in range(0, len(pcm), step):
-			last = start + step >= len(pcm)
-			item = (generation, pcm[start:start + step], onDone if last else None)
-			while True:
-				if generation != self._generation:
-					return  # cancelled; the rest is never heard
-				try:
-					self._feedQueue.put(item, timeout=0.02)
+		while True:
+			if generation != self._generation:
+				return  # cancelled; none of it is heard
+			with self._pendingLock:
+				if self._pendingBytes < self.PREBUFFER_BYTES:
+					self._pendingBytes += len(pcm)
 					break
-				except queue.Full:
-					pass
-			self._fedBytes += len(item[1])
+			time.sleep(0.005)
+		self._fedBytes += len(pcm)
+		self._feedQueue.put((generation, pcm, onDone))
 
 	def _feedLoop(self):
 		"""Hand queued audio to the device, off the synthesis thread.
 
 		feed() blocks until the device has room. Absorbing that here is what
 		lets the engine run ahead; it also means a cancel landing while a feed
-		is blocked has already run stop() on the main thread, so the slice
+		is blocked has already run stop() on the main thread, so the chunk
 		this thread then hands over went in *behind* the stop and would be the
 		only thing the user hears of the cancelled announcement — hence the
 		recheck and second stop() after every feed.
@@ -700,6 +702,8 @@ class SynthDriver(BaseSynthDriver):
 			if item is None:
 				break
 			generation, pcm, onDone = item
+			with self._pendingLock:
+				self._pendingBytes = max(0, self._pendingBytes - len(pcm))
 			if generation != self._generation:
 				continue
 			debug = log.isEnabledFor(log.DEBUG)
