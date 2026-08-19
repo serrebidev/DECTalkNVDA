@@ -14,8 +14,10 @@
 
 import ctypes
 import json
+import os
 import queue
 import threading
+import time
 from collections import OrderedDict
 from functools import partial
 
@@ -99,6 +101,19 @@ class SynthDriver(BaseSynthDriver):
 			availableInSettingsRing=True,
 		),
 		NumericDriverSetting(
+			# NVDA routinely asks for an announcement and then cancels it
+			# ~150 ms later when a newer focus event arrives (alt+tab is the
+			# worst case). Feeding the moment audio exists lets a syllable
+			# escape before the cancel lands, heard as stuttering. Holding the
+			# first audio of an utterance back this long means such an
+			# announcement is never heard at all. The hold is measured from
+			# when NVDA asked, so it only costs latency on the first utterance
+			# of a burst — continuous speech is unaffected. 0 disables it.
+			"startupHold", "Hold before first audio (ms)", defaultVal=180,
+			minVal=0, maxVal=500, normalStep=20,
+			availableInSettingsRing=True,
+		),
+		NumericDriverSetting(
 			"sentencePause", "Sentence pause (ms)", defaultVal=0,
 			minVal=_params.SENTENCE_PAUSE_RANGE[0], maxVal=_params.SENTENCE_PAUSE_RANGE[1],
 		),
@@ -162,23 +177,56 @@ class SynthDriver(BaseSynthDriver):
 		self._inflection = 50  # NVDA 0..100; 50 = the voice's own pitch range
 		self._volume = 72  # [:vo set], 0..99
 		self._spf = 100
+		self._startupHold = 180
+		self._holdUntil = None
+		self._holdGeneration = 0
+		# True while the device still has audio of ours to play. The startup
+		# hold is only worth paying when it does not — mid-stream there is a
+		# backlog covering the next utterance already, and delaying it there
+		# would insert exactly the gaps the hold exists to avoid.
+		self._audioLive = False
 		self._sentencePause = 0
 		self._commaPause = 0
 		self._splitMultiCase = True
 		self._inlineCommands = True
 
 		self._queue = queue.Queue()
+		# Completion (player idle + synthDoneSpeaking) runs on its own thread:
+		# WavePlayer.idle() blocks until every fed sample has played, and doing
+		# that on the synthesis thread means the next utterance cannot even
+		# start being built until the device has run dry — the chop this driver
+		# used to have between phrases.
+		self._doneQueue = queue.Queue()
+		self._busy = False  # worker is mid-utterance
+		# Per-utterance timing, logged at debug level: dead air between
+		# phrases does not show up in the audio itself, so the log is the
+		# only place it is visible.
+		self._fedBytes = 0
+		self._firstFeed = None
+		# While debug logging is on, everything fed to the player is also
+		# written to a wav in the temp directory. Playback problems that the
+		# synthesized audio itself does not contain can only be told apart
+		# from ones it does by looking at exactly what reached the device.
+		self._dump = None
+		self._dumpBytes = 0
 		self._generation = 0
 		self._genLock = threading.Lock()
 		self._thread = threading.Thread(
 			target=self._workerLoop, name="DECtalkSynth", daemon=True
 		)
 		self._thread.start()
+		self._doneThread = threading.Thread(
+			target=self._doneLoop, name="DECtalkDone", daemon=True
+		)
+		self._doneThread.start()
 
 	def terminate(self):
 		self.cancel()
+		self._closeDump()
 		self._queue.put(None)
+		self._doneQueue.put(None)
 		self._thread.join(timeout=5)
+		self._doneThread.join(timeout=5)
 		self._player.close()
 		self._engine.close()
 
@@ -198,16 +246,22 @@ class SynthDriver(BaseSynthDriver):
 
 	def speak(self, speechSequence):
 		ops = self._buildOps(speechSequence)
-		self._queue.put((self._generation, ops))
+		self._queue.put((self._generation, ops, time.perf_counter()))
 
 	def cancel(self):
+		if log.isEnabledFor(log.DEBUG):
+			log.debug("DECtalk: cancel at %.2f s in dump" % (self._dumpPos(),))
 		with self._genLock:
 			self._generation += 1
-		try:
-			while True:
-				self._queue.get_nowait()
-		except queue.Empty:
-			pass
+		for q in (self._queue, self._doneQueue):
+			try:
+				while True:
+					if q.get_nowait() is None:
+						q.put(None)
+						break
+			except queue.Empty:
+				pass
+		self._audioLive = False  # stop() empties the device
 		self._player.stop()
 		self._engine.stop()
 
@@ -387,7 +441,11 @@ class SynthDriver(BaseSynthDriver):
 		sample = text or "DECtalk voice preview. The quick brown fox jumps over the lazy dog."
 		prefix = self._commandPrefixFor(base, clean, isCustom=True)
 		self.cancel()
-		self._queue.put((self._generation, [("text", prefix + _text.engine_ascii(sample))]))
+		self._queue.put((
+			self._generation,
+			[("text", prefix + _text.engine_ascii(sample))],
+			time.perf_counter(),
+		))
 
 	# -- worker thread -------------------------------------------------------
 
@@ -396,25 +454,88 @@ class SynthDriver(BaseSynthDriver):
 			item = self._queue.get()
 			if item is None:
 				break
-			generation, ops = item
+			generation, ops, queuedAt = item
 			if generation != self._generation:
 				continue
+			self._busy = True
+			self._fedBytes = 0
+			self._firstFeed = None
+			self._holdGeneration = generation
+			self._holdUntil = (
+				queuedAt + self._startupHold / 1000.0
+				if self._startupHold and not self._audioLive
+				else None
+			)
+			started = time.perf_counter()
 			try:
 				self._processUtterance(generation, ops)
 			except Exception:
 				log.exception("DECtalk: error processing utterance")
+			finally:
+				self._busy = False
+			if log.isEnabledFor(log.DEBUG):
+				log.debug(
+					"DECtalk: utterance queued->start %.0f ms, synth %.0f ms, "
+					"first audio +%.0f ms, %.0f ms of speech, %d still queued, "
+					"dump ends %.2f s"
+					% (
+						(started - queuedAt) * 1000,
+						(time.perf_counter() - started) * 1000,
+						((self._firstFeed - started) * 1000) if self._firstFeed else -1,
+						self._fedBytes / 2.0 / _dectalk.SAMPLE_RATE * 1000,
+						self._queue.qsize(),
+						self._dumpPos(),
+					)
+				)
 			# Report completion only once the pipeline is drained. NVDA queues
 			# several utterances ahead during continuous reading (say all); a
 			# synthDoneSpeaking fired between chunks tells NVDA speech ended and
-			# stalls the read. Idle the player here too (not between chunks) so
-			# audio flows continuously.
+			# stalls the read. The idle/notify itself happens on _doneLoop so
+			# this thread stays free to synthesize whatever arrives next.
 			if generation == self._generation and self._queue.empty():
+				self._doneQueue.put(generation)
+
+	def _doneLoop(self):
+		"""Idle the player and report synthDoneSpeaking, off the synth thread.
+
+		WavePlayer.idle() blocks until playback has drained, so it must never
+		run on the thread that builds the next utterance.
+		"""
+		while True:
+			generation = self._doneQueue.get()
+			if generation is None:
+				break
+			# Only the newest request matters; collapse any backlog.
+			while True:
 				try:
-					self._player.idle()
-				except Exception:
-					log.exception("DECtalk: player idle failed")
-				if generation == self._generation and self._queue.empty():
-					synthDoneSpeaking.notify(synth=self)
+					nxt = self._doneQueue.get_nowait()
+				except queue.Empty:
+					break
+				if nxt is None:
+					self._doneQueue.put(None)
+					break
+				generation = nxt
+			if generation != self._generation or self._busy or not self._queue.empty():
+				# More speech is already on the way — leave the stream running.
+				continue
+			idleStart = time.perf_counter()
+			try:
+				self._player.idle()
+			except Exception:
+				log.exception("DECtalk: player idle failed")
+			self._audioLive = False
+			if log.isEnabledFor(log.DEBUG):
+				log.debug(
+					"DECtalk: drained player in %.0f ms"
+					% ((time.perf_counter() - idleStart) * 1000)
+				)
+			if (
+				generation == self._generation
+				and not self._busy
+				and self._queue.empty()
+				and self._doneQueue.empty()
+			):
+				synthDoneSpeaking.notify(synth=self)
 
 	def _processUtterance(self, generation, ops):
 		self._sonicActive = self._sonicBoostActive()
@@ -443,12 +564,95 @@ class SynthDriver(BaseSynthDriver):
 			elif kind == "silence":
 				frames = int(_dectalk.SAMPLE_RATE * payload / 1000.0 / speed)
 				if frames > 0 and generation == self._generation:
-					self._player.feed(b"\x00\x00" * frames)
+					self._playerFeed(b"\x00\x00" * frames)
 		# Player idle + synthDoneSpeaking are handled by _workerLoop once the
 		# whole queue drains, so continuous reading isn't interrupted between
 		# chunks (see the comment there).
 
 	# -- Sonic time-stretch (rate boost) --------------------------------------
+
+	def _playerFeed(self, pcm, onDone=None):
+		"""The single point every sample passes through, so the debug timing
+		above can see when audio actually starts reaching the device."""
+		if self._holdGeneration != self._generation:
+			return  # cancelled; nothing of this utterance may be heard
+		if self._holdUntil is not None and not self._waitOutStartupHold():
+			return
+		if self._firstFeed is None:
+			self._firstFeed = time.perf_counter()
+		self._fedBytes += len(pcm)
+		self._audioLive = True
+		if log.isEnabledFor(log.DEBUG):
+			self._writeDump(pcm)
+		elif self._dump is not None:
+			self._closeDump()
+		self._player.feed(pcm, onDone=onDone)
+
+	# -- debug audio dump ----------------------------------------------------
+
+	def _waitOutStartupHold(self):
+		"""Block until this utterance's startup hold expires.
+
+		Returns False if it was cancelled while waiting, in which case not one
+		sample of it should reach the player. Runs on the engine's callback
+		thread, which only stalls synthesis — the engine is far faster than
+		real time, so the audio is ready the moment the hold lifts.
+		"""
+		deadline = self._holdUntil
+		self._holdUntil = None
+		if deadline is None:
+			return True
+		generation = self._holdGeneration
+		while True:
+			if generation != self._generation:
+				return False
+			remaining = deadline - time.perf_counter()
+			if remaining <= 0:
+				return generation == self._generation
+			time.sleep(min(remaining, 0.01))
+
+	def _dumpPos(self):
+		"""Seconds written to the debug wav so far, for lining the log up
+		against the recording."""
+		return self._dumpBytes / 2.0 / _dectalk.SAMPLE_RATE
+
+	def _writeDump(self, pcm):
+		"""Append `pcm` to the debug wav, opening it on first use."""
+		if self._dump is None:
+			import tempfile
+			import wave
+			self._dumpBytes = 0
+			name = "dectalk-fed-%s.wav" % time.strftime("%H%M%S")
+			path = os.path.join(tempfile.gettempdir(), name)
+			try:
+				w = wave.open(path, "wb")
+				w.setnchannels(1)
+				w.setsampwidth(2)
+				w.setframerate(_dectalk.SAMPLE_RATE)
+			except Exception:
+				log.exception("DECtalk: could not open audio dump")
+				self._dump = False  # do not keep retrying
+				return
+			log.info("DECtalk: writing fed audio to %s" % path)
+			self._dump = w
+		if self._dump is False:
+			return
+		try:
+			self._dump.writeframes(pcm)
+			self._dumpBytes += len(pcm)
+		except Exception:
+			log.exception("DECtalk: audio dump failed")
+			self._closeDump()
+			self._dump = False
+
+	def _closeDump(self):
+		dump = self._dump
+		self._dump = None
+		if dump:
+			try:
+				dump.close()
+			except Exception:
+				log.exception("DECtalk: closing audio dump failed")
 
 	def _drainSonic(self, discard=False, onDone=None):
 		"""Feed the player everything Sonic has processed so far."""
@@ -456,9 +660,7 @@ class SynthDriver(BaseSynthDriver):
 		if stream.samplesAvailable > 0:
 			data = stream.readShort()
 			if not discard:
-				self._player.feed(
-					ctypes.string_at(data, len(data) * 2), onDone=onDone
-				)
+				self._playerFeed(ctypes.string_at(data, len(data) * 2), onDone=onDone)
 				return
 		if onDone is not None:
 			onDone()
@@ -471,7 +673,7 @@ class SynthDriver(BaseSynthDriver):
 		"""Feed PCM to the player, through Sonic when rate boost is active."""
 		if not self._sonicActive:
 			if pcm:
-				self._player.feed(pcm, onDone=onDone)
+				self._playerFeed(pcm, onDone=onDone)
 			elif onDone is not None:
 				onDone()
 			return
@@ -613,6 +815,12 @@ class SynthDriver(BaseSynthDriver):
 		# Floor at the slider minimum even for values arriving from config:
 		# near-0 SPF collapses speech to a blip with no spoken way back.
 		self._spf = _clamp(value, 10, _params.SPF_RANGE[1])
+
+	def _get_startupHold(self):
+		return self._startupHold
+
+	def _set_startupHold(self, value):
+		self._startupHold = _clamp(value, 0, 500)
 
 	def _get_sentencePause(self):
 		return self._sentencePause
